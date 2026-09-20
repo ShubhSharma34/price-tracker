@@ -112,7 +112,7 @@ your-project/
     ├── index.html            ← Vite entry HTML
     ├── package.json          ← dependencies
     ├── vite.config.js        ← Vite config with dev proxy
-    ├── .env.example          ← copy to .env and fill values
+    ├── .env.example          
     └── src/
         ├── main.jsx          ← React root
         ├── App.jsx           ← router setup
