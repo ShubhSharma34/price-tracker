@@ -14,126 +14,44 @@ function parsePrice(raw) {
   return isNaN(num) ? null : num
 }
 
-async function extractPrice(page) {
-  return await page.evaluate(() => {
-    const block = document.querySelector('.price-block')
-    if (!block) return { priceText: null, stockText: 'unknown' }
-
-    let priceText = null
-
-    // Primary: data-price hidden span (clean ASCII digits)
-    const dp = block.querySelector('[data-price="true"]')
-    if (dp) {
-      const t = dp.textContent.trim()
-      if (t && t.includes('₹')) priceText = t
+async function dismissCookies(page) {
+  // Method 1: Click via JavaScript — works even in headless
+  const dismissed = await page.evaluate(() => {
+    // Find any Accept/cookie button
+    const buttons = Array.from(document.querySelectorAll('button'))
+    const acceptBtn = buttons.find(b => {
+      const txt = b.innerText?.toLowerCase() || ''
+      return txt.includes('accept') || txt.includes('agree') || txt.includes('ok')
+    })
+    if (acceptBtn) {
+      acceptBtn.click()
+      return true
     }
 
-    // Fallback: bold element font-weight:700
-    if (!priceText) {
-      for (const el of block.querySelectorAll('*')) {
-        const style = el.getAttribute('style') || ''
-        if (style.includes('font-weight: 700') || style.includes('font-weight:700')) {
-          const t = el.textContent.trim()
-          if (t && t.includes('₹') && /[\d０-９]/.test(t)) { priceText = t; break }
-        }
-      }
-    }
-
-    // Fallback: pv-* class
-    if (!priceText) {
-      for (const el of block.querySelectorAll('*')) {
-        if (Array.from(el.classList).some(c => /^pv-/.test(c))) {
-          const t = el.textContent.trim()
-          if (t && t.includes('₹') && /[\d０-９]/.test(t)) { priceText = t; break }
-        }
-      }
-    }
-
-    // Fallback: any ₹ number
-    if (!priceText) {
-      const m = block.textContent.match(/₹[\d０-９,]+/)
-      if (m) priceText = m[0]
-    }
-
-    // Stock
-    let stockText = 'unknown'
-    const badge = block.querySelector('.stock-badge')
-    if (badge) {
-      const cls = badge.className
-      const txt = badge.innerText?.toLowerCase() || ''
-      if (cls.includes('out-of-stock') || txt.includes('out of stock')) stockText = 'out_of_stock'
-      else if (cls.includes('in-stock') || /\d+ in stock/.test(txt)) stockText = 'in_stock'
-    }
-    if (stockText === 'unknown') {
-      const full = document.body.innerText?.toLowerCase() || ''
-      if (full.includes('out of stock')) stockText = 'out_of_stock'
-      else if (full.includes('in stock')) stockText = 'in_stock'
-    }
-
-    return { priceText, stockText, blockClass: block.className }
-  })
-}
-
-async function triggerPriceReveal(page) {
-  // Method 1: Find React fiber on the price block and call its event handlers
-  const reactTriggered = await page.evaluate(() => {
-    const block = document.querySelector('.price-block')
-    if (!block) return false
-
-    // Find React internal fiber key
-    const fiberKey = Object.keys(block).find(k =>
-      k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
-    )
-
-    if (fiberKey) {
-      let fiber = block[fiberKey]
-      // Walk up fiber tree to find onMouseEnter/onPointerEnter handlers
-      while (fiber) {
-        const props = fiber.memoizedProps || fiber.pendingProps
-        if (props) {
-          const handler = props.onMouseEnter || props.onPointerEnter || props.onMouseOver
-          if (handler) {
-            try {
-              handler({ type: 'mouseenter', bubbles: true })
-              return true
-            } catch(e) {}
-          }
-        }
-        fiber = fiber.return
-      }
+    // Also try removing the overlay directly
+    const overlay = document.querySelector('.cookie-overlay, [class*="cookie"], [id*="cookie"]')
+    if (overlay) {
+      overlay.remove()
+      return true
     }
     return false
   })
 
-  if (reactTriggered) {
-    console.log(`      React handler triggered`)
-    await sleep(2000)
+  if (dismissed) {
+    console.log(`    Dismissed cookie via JS`)
+    await sleep(1000)
     return
   }
 
-  // Method 2: Dispatch events on every parent element up to body
-  await page.evaluate(() => {
-    const block = document.querySelector('.price-block')
-    if (!block) return
-
-    const rect = block.getBoundingClientRect()
-    const x = rect.left + rect.width / 2
-    const y = rect.top + rect.height / 2
-
-    const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }
-
-    // Fire on block and all parents
-    let el = block
-    while (el && el !== document.body) {
-      el.dispatchEvent(new MouseEvent('mouseover', opts))
-      el.dispatchEvent(new MouseEvent('mouseenter', { ...opts, bubbles: false }))
-      el.dispatchEvent(new PointerEvent('pointerover', opts))
-      el.dispatchEvent(new PointerEvent('pointerenter', { ...opts, bubbles: false }))
-      el = el.parentElement
+  // Method 2: Playwright locator with force
+  try {
+    const btn = page.locator('button:has-text("Accept"), button:has-text("ACCEPT"), button:has-text("agree")')
+    if (await btn.count() > 0) {
+      await btn.first().click({ force: true })
+      console.log(`    Dismissed cookie via locator`)
+      await sleep(1000)
     }
-  })
-
-  await sleep(2000)
+  } catch { }
 }
 
 async function scrapeWithPlaywright(url, attemptNumber) {
@@ -154,23 +72,44 @@ async function scrapeWithPlaywright(url, attemptNumber) {
     viewport: { width: 1280, height: 800 },
   })
 
+  // Set cookie consent cookie so popup never appears
+  await context.addCookies([{
+    name: 'cookie_consent',
+    value: 'accepted',
+    domain: 'demo.inelabteamdev.com',
+    path: '/',
+  }, {
+    name: 'cookieConsent',
+    value: 'true',
+    domain: 'demo.inelabteamdev.com',
+    path: '/',
+  }])
+
   const page = await context.newPage()
 
   try {
     console.log(`  → Attempt ${attemptNumber} [${isServer ? 'headless' : 'headed'}]: ${url}`)
 
     await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 })
-    await sleep(2000)
+    await sleep(1500)
 
-    // Dismiss cookie popup
-    try {
-      const acceptBtn = page.locator('button:has-text("Accept"), button:has-text("ACCEPT")')
-      if (await acceptBtn.count() > 0) {
-        await acceptBtn.first().click()
-        console.log(`    Dismissed cookie popup`)
-        await sleep(1000)
-      }
-    } catch { }
+    // Always try to dismiss cookies — belt and suspenders approach
+    await dismissCookies(page)
+
+    // Remove cookie overlay if still present
+    await page.evaluate(() => {
+      const overlays = document.querySelectorAll('.cookie-overlay, [class*="cookie-banner"], [class*="cookie-consent"]')
+      overlays.forEach(el => el.remove())
+
+      // Also remove any fixed overlays blocking the page
+      const allFixed = Array.from(document.querySelectorAll('*')).filter(el => {
+        const style = window.getComputedStyle(el)
+        return (style.position === 'fixed' || style.position === 'sticky') &&
+               el.className.toString().toLowerCase().includes('cookie')
+      })
+      allFixed.forEach(el => el.remove())
+    })
+    await sleep(500)
 
     await page.waitForSelector('.price-block', { timeout: 10000 })
 
@@ -195,27 +134,42 @@ async function scrapeWithPlaywright(url, attemptNumber) {
           await sleep(1500)
         }
       } else {
-        // SERVER: React fiber trigger + event dispatch
-        await triggerPriceReveal(page)
+        // SERVER: trigger React hover events + remove overlay again just in case
+        await page.evaluate(() => {
+          // Remove any overlays blocking clicks
+          document.querySelectorAll('.cookie-overlay, [class*="overlay"]').forEach(el => {
+            const txt = el.innerText?.toLowerCase() || ''
+            if (txt.includes('cookie') || txt.includes('consent')) el.remove()
+          })
+
+          const block = document.querySelector('.price-block')
+          if (!block) return
+
+          const rect = block.getBoundingClientRect()
+          const x = rect.left + rect.width / 2
+          const y = rect.top + rect.height / 2
+          const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }
+
+          block.dispatchEvent(new MouseEvent('mouseover', opts))
+          block.dispatchEvent(new MouseEvent('mouseenter', { ...opts, bubbles: false }))
+          block.dispatchEvent(new PointerEvent('pointerover', opts))
+          block.dispatchEvent(new PointerEvent('pointerenter', { ...opts, bubbles: false }))
+          block.dispatchEvent(new MouseEvent('mousemove', opts))
+        })
+        await sleep(2000)
       }
 
-      // Check button state
-      const btnEnabled = await page.evaluate(() => {
+      // Always use JS click — bypasses Playwright's overlay detection
+      await page.evaluate(() => {
         const btn = document.querySelector('.price-block button')
-        return btn ? !btn.disabled : false
+        if (btn) {
+          btn.disabled = false
+          btn.removeAttribute('disabled')
+          btn.click()
+        }
       })
-      console.log(`      Button enabled: ${btnEnabled}`)
+      console.log(`      Clicked button via JS`)
 
-     // Always use evaluate click — avoids Playwright's "enabled" check entirely
-await page.evaluate(() => {
-  const btn = document.querySelector('.price-block button')
-  if (btn) {
-    btn.disabled = false
-    btn.removeAttribute('disabled')
-    btn.click()
-  }
-})
-console.log(`      Clicked button via JS (enabled: ${btnEnabled})`)
       // Wait for price block to leave idle state
       try {
         await page.waitForFunction(() => {
@@ -224,13 +178,71 @@ console.log(`      Clicked button via JS (enabled: ${btnEnabled})`)
         }, { timeout: 10000 })
         console.log(`      Price revealed ✓`)
       } catch {
-        console.log(`      Still idle — will extract anyway`)
+        console.log(`      Still idle — extracting anyway`)
       }
 
       await sleep(2000)
 
-      const result = await extractPrice(page)
-      console.log(`      Extracted: "${result.priceText}", stock: "${result.stockText}", block: "${result.blockClass}"`)
+      // Extract price
+      const result = await page.evaluate(() => {
+        const block = document.querySelector('.price-block')
+        if (!block) return { priceText: null, stockText: 'unknown' }
+
+        let priceText = null
+
+        // Primary: data-price hidden span
+        const dp = block.querySelector('[data-price="true"]')
+        if (dp) {
+          const t = dp.textContent.trim()
+          if (t && t.includes('₹')) priceText = t
+        }
+
+        // Fallback: font-weight:700 element
+        if (!priceText) {
+          for (const el of block.querySelectorAll('*')) {
+            const style = el.getAttribute('style') || ''
+            if (style.includes('font-weight: 700') || style.includes('font-weight:700')) {
+              const t = el.textContent.trim()
+              if (t && t.includes('₹') && /[\d０-９]/.test(t)) { priceText = t; break }
+            }
+          }
+        }
+
+        // Fallback: pv-* class
+        if (!priceText) {
+          for (const el of block.querySelectorAll('*')) {
+            if (Array.from(el.classList).some(c => /^pv-/.test(c))) {
+              const t = el.textContent.trim()
+              if (t && t.includes('₹') && /[\d０-９]/.test(t)) { priceText = t; break }
+            }
+          }
+        }
+
+        // Fallback: any ₹ number
+        if (!priceText) {
+          const m = block.textContent.match(/₹[\d０-９,]+/)
+          if (m) priceText = m[0]
+        }
+
+        // Stock
+        let stockText = 'unknown'
+        const badge = block.querySelector('.stock-badge')
+        if (badge) {
+          const cls = badge.className
+          const txt = badge.innerText?.toLowerCase() || ''
+          if (cls.includes('out-of-stock') || txt.includes('out of stock')) stockText = 'out_of_stock'
+          else if (cls.includes('in-stock') || /\d+ in stock/.test(txt)) stockText = 'in_stock'
+        }
+        if (stockText === 'unknown') {
+          const full = document.body.innerText?.toLowerCase() || ''
+          if (full.includes('out of stock')) stockText = 'out_of_stock'
+          else if (full.includes('in stock')) stockText = 'in_stock'
+        }
+
+        return { priceText, stockText, blockClass: block.className }
+      })
+
+      console.log(`      Extracted: "${result.priceText}", stock: "${result.stockText}"`)
 
       if (result.priceText) {
         priceText = result.priceText
@@ -240,20 +252,16 @@ console.log(`      Clicked button via JS (enabled: ${btnEnabled})`)
 
       // Click refresh if visible
       try {
-        const refreshBtn = page.locator('button:has-text("Refresh")')
-        if (await refreshBtn.count() > 0) {
-          await refreshBtn.first().click()
-          console.log(`      Clicked refresh button`)
-          await sleep(3000)
-        }
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'))
+          const refresh = buttons.find(b => b.innerText?.toLowerCase().includes('refresh'))
+          if (refresh) refresh.click()
+        })
+        await sleep(3000)
       } catch { }
-
-      // Small wait before next attempt
-      await sleep(1000)
     }
 
     console.log(`    Final: "${priceText}" → ${parsePrice(priceText)}, stock: ${stockText}`)
-
     if (!priceText) throw new Error('Price not found after all attempts')
 
     return { price: parsePrice(priceText), stock: stockText }
