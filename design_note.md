@@ -96,6 +96,33 @@ After getting Playwright working, prices like ₹25,852 were returning wrong val
 **Off-screen window trick failed**
 To hide the Chrome window locally, the AI tried `--window-position=-32000,-32000`. This silently broke hover because the OS does not deliver mouse events to off-screen windows. Fixed by keeping the window on-screen and using CDP to minimize it between interactions.
 
+your-project/
+├── backend/
+│   ├── index.js              ← server entry point
+│   ├── package.json          ← dependencies
+│   ├── .env.example          ← copy to .env and fill values
+│   ├── lib/
+│   │   ├── db.js             ← Neon DB connection + table setup
+│   │   └── scraper.js        ← scraping logic (Cheerio + Playwright)
+│   └── routes/
+│       ├── products.js       ← CRUD API for products
+│       └── scrape.js         ← scrape trigger + logs API
+│
+└── frontend/
+    ├── index.html            ← Vite entry HTML
+    ├── package.json          ← dependencies
+    ├── vite.config.js        ← Vite config with dev proxy
+    ├── .env.example          ← copy to .env and fill values
+    └── src/
+        ├── main.jsx          ← React root
+        ├── App.jsx           ← router setup
+        ├── api.js            ← all backend calls
+        ├── index.css         ← all styles
+        └── pages/
+            ├── Search.jsx    ← add product page
+            ├── Dashboard.jsx ← the bonus dashboard
+            └── Product.jsx   ← single product + chart
+
 **Cookie overlay blocking server clicks**
 On the server, the cookie consent overlay was intercepting all pointer events even after our dismissal attempt. Fixed by pre-setting cookie consent cookies in the browser context before page load, plus removing the overlay DOM element directly via `page.evaluate()`.
 
