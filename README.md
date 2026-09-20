@@ -1,118 +1,175 @@
-# Product Price Tracker — INE Assignment
+# Price Tracker — INE Software Engineer Intern Assignment
 
-## Stack
-- **Frontend**: React + Vite → deployed on Vercel
-- **Backend**: Node.js (Express) → deployed on Render
-- **Database**: Neon (PostgreSQL) — used instead of Supabase due to regional access restrictions; same SQL schema
-- **Scraping**: Axios + Cheerio (lightweight), Playwright fallback (for JS-rendered content)
-- **Scheduling**: cron-job.org → calls `/api/scrape` every 2 hours
+A full-stack web application that tracks product prices from the INE mock store by scraping on a fixed schedule.
+
+**Live site:** https://price-tracker-rho-nine.vercel.app  
+**GitHub:** https://github.com/ShubhSharma34/price-tracker
 
 ---
 
-## Local Development
+## Stack
 
-### 1. Clone & install
+| Layer | Technology |
+|---|---|
+| Frontend | React + Vite → Vercel |
+| Backend | Node.js (Express) → Render |
+| Database | Supabase (PostgreSQL) |
+| Scraping | Playwright (Chromium) |
+| Scheduling | cron-job.org (every 2 hours) |
 
+> **Note on database:** Supabase is geo-restricted in some regions. If unavailable, Neon (neon.com) is a drop-in replacement — same PostgreSQL schema, just update `DATABASE_URL` in `.env`.
+
+---
+
+## Features
+
+- Search and track products from `demo.inelabteamdev.com`
+- Automatic price and stock scraping every 2 hours via external cron
+- Price history chart per product
+- Per-product scrape log showing every attempt (success, retried, failed) with duration and error
+- Dashboard across all tracked products with summary stats, price change indicators, and global scrape log
+- Dark/Light mode toggle
+- Manual "Scrape Now" button for immediate testing
+
+---
+
+## Local Setup
+
+### Prerequisites
+- Node.js 18+
+- A Supabase project (or Neon as alternative)
+
+### 1. Clone the repo
 ```bash
-git clone <your-repo>
-
-# Backend
-cd backend
-npm install
-cp .env.example .env    # fill in your DATABASE_URL and CRON_SECRET
-
-# Frontend
-cd ../frontend
-npm install
-cp .env.example .env    # fill in VITE_API_URL (leave blank for local dev)
+git clone https://github.com/ShubhSharma34/price-tracker.git
+cd price-tracker
 ```
 
-### 2. Set up Neon database
+### 2. Backend setup
+```bash
+cd backend
+npm install
+npx playwright install chromium
+cp .env.example .env
+```
 
-1. Go to [neon.com](https://neon.com) → sign up free
-2. Create a project → pick **Singapore** region (lowest latency from India)
-3. Copy the **Connection string** → paste as `DATABASE_URL` in `backend/.env`
-4. Tables are created automatically on first backend start
+Fill in `backend/.env`:
+```
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_KEY=eyJ...
+CRON_SECRET=your-random-secret
+FRONTEND_URL=http://localhost:5173
+PORT=4000
+```
 
-### 3. Run locally
+### 3. Create database tables
+Go to Supabase → SQL Editor and run:
+```sql
+CREATE TABLE IF NOT EXISTS products (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  url TEXT NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
 
+CREATE TABLE IF NOT EXISTS price_history (
+  id SERIAL PRIMARY KEY,
+  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+  price NUMERIC(10,2),
+  stock TEXT,
+  scraped_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scrape_log (
+  id SERIAL PRIMARY KEY,
+  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  error_msg TEXT,
+  retries INTEGER DEFAULT 0,
+  duration_ms INTEGER,
+  scraped_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### 4. Frontend setup
+```bash
+cd ../frontend
+npm install
+cp .env.example .env
+```
+
+Leave `VITE_API_URL` blank for local dev (Vite proxy handles it):
+```
+VITE_API_URL=
+```
+
+### 5. Run locally
 ```bash
 # Terminal 1 — backend
-cd backend && npm run dev
-# Starts on http://localhost:4000
+cd backend && node index.js
 
 # Terminal 2 — frontend
 cd frontend && npm run dev
-# Starts on http://localhost:5173
 ```
+
+Open http://localhost:5173
 
 ---
 
-## Deployment
+## Observable Headed Run
 
-### Backend → Render
+To run the scraper in headed mode (visible browser) for screen recording:
 
-1. Push code to GitHub
-2. Go to [render.com](https://render.com) → New → Web Service → connect your repo
-3. Set **Root directory**: `backend`
-4. **Build command**: `npm install`
-5. **Start command**: `node index.js`
-6. Add environment variables:
-   - `DATABASE_URL` = your Neon connection string
-   - `CRON_SECRET` = any random secret string
-   - `FRONTEND_URL` = your Vercel URL (add after step below)
-7. Deploy → copy the Render URL (e.g. `https://price-tracker-api.onrender.com`)
+```bash
+cd backend
+node headed-run.js
+```
 
-### Frontend → Vercel
-
-1. Go to [vercel.com](https://vercel.com) → New Project → import repo
-2. Set **Root directory**: `frontend`
-3. Add environment variable:
-   - `VITE_API_URL` = your Render backend URL
-4. Deploy → copy the Vercel URL → paste into Render's `FRONTEND_URL` env var → redeploy Render
-
-### Cron → cron-job.org
-
-1. Go to [cron-job.org](https://cron-job.org) → sign up free
-2. Create a new cronjob:
-   - **URL**: `https://your-render-url.onrender.com/api/scrape`
-   - **Method**: POST
-   - **Header**: `x-cron-secret: <your CRON_SECRET value>`
-   - **Schedule**: every 2 hours
-3. Also add a second "keep warm" job:
-   - **URL**: `https://your-render-url.onrender.com/health`
-   - **Method**: GET
-   - **Schedule**: every 14 minutes (prevents Render free tier from sleeping)
+This opens a real Chrome window and scrapes all tracked products. You can watch the mouse move to the price block, the Reveal Price button being clicked, and the price loading. The terminal simultaneously logs every step including retries and failures.
 
 ---
 
 ## Scraping Schedule
 
-- Runs every **2 hours** via cron-job.org external trigger
+- Runs every **2 hours** via cron-job.org external HTTP trigger
 - Each run scrapes all tracked products sequentially
-- Free-tier Render instances sleep — the keep-warm cron prevents this
+- A separate keep-warm cron hits `/health` every 14 minutes to prevent Render free tier from sleeping
+
+---
+
+## Deployment
+
+### Backend (Render)
+1. New Web Service → connect GitHub repo
+2. Root directory: `backend`
+3. Build command: `npm install && node node_modules/playwright/cli.js install chromium`
+4. Start command: `PLAYWRIGHT_BROWSERS_PATH=0 node index.js`
+5. Environment variables:
+   - `SUPABASE_URL`
+   - `SUPABASE_SERVICE_KEY`
+   - `CRON_SECRET`
+   - `FRONTEND_URL`
+   - `RENDER=true`
+   - `PLAYWRIGHT_BROWSERS_PATH=0`
+
+### Frontend (Vercel)
+1. New Project → import repo
+2. Root directory: `frontend`
+3. Environment variable: `VITE_API_URL=https://your-render-url.onrender.com`
+
+### Cron (cron-job.org)
+See setup instructions below.
+
+---
 
 ## Environment Variables
 
 | Variable | Where | Description |
 |---|---|---|
-| `DATABASE_URL` | backend | Neon PostgreSQL connection string |
-| `CRON_SECRET` | backend | Protects the `/api/scrape` endpoint |
-| `FRONTEND_URL` | backend | Your Vercel URL (for CORS) |
-| `VITE_API_URL` | frontend | Your Render backend URL |
-
----
-
-## Design Decisions
-
-### Why Cheerio first, Playwright fallback?
-The assignment explicitly prefers lightweight HTTP fetching over a headless browser. Cheerio is ~100× faster and uses far less memory. We only launch Playwright when the price element doesn't appear in the raw HTML (usually because it's rendered by JavaScript).
-
-### Why honest failure logging?
-Every scrape attempt — including failures and retries — is written to `scrape_log`. Failures are never hidden. The dashboard shows the real success rate. This matches what the assignment explicitly requires.
-
-### Why Neon instead of Supabase?
-Supabase is geo-restricted in India. Neon is pure PostgreSQL with a permanent free tier, accessible from India, with a Singapore region for low latency. The schema, SQL queries, and `pg` driver are identical to what Supabase would use.
-
-### What my AI tools got wrong on the first attempt
-The initial scraper used a single CSS selector (`.price`) which works on standard WooCommerce but missed the `bdi` wrapper inside sale-price markup. Also the first retry logic retried on *all* errors including "price not found" — which wastes time retrying a structural issue that Playwright, not more retries, should solve. Fixed by splitting error types: network errors → retry with Cheerio; "not found" → fall through to Playwright immediately.
+| `SUPABASE_URL` | backend | Supabase project URL |
+| `SUPABASE_SERVICE_KEY` | backend | Supabase service role key |
+| `CRON_SECRET` | backend | Protects `/api/scrape` endpoint |
+| `FRONTEND_URL` | backend | Vercel URL for CORS |
+| `RENDER` | backend | Set to `true` on Render server |
+| `PLAYWRIGHT_BROWSERS_PATH` | backend | Set to `0` on Render |
+| `VITE_API_URL` | frontend | Render backend URL |
