@@ -13,7 +13,7 @@ function parsePrice(raw) {
 
 async function scrapeWithPlaywright(url, attemptNumber) {
   const browser = await chromium.launch({
-    headless: false,
+    headless: process.env.RENDER === 'true',
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,800'],
   })
 
