@@ -1,96 +1,58 @@
-# Design Note — Scraping Reliability & Trade-offs
+# Design Note — Price Tracker
 
 ## How I made scraping reliable
 
-The INE mock store is deliberately awkward in several ways:
-- Prices are hidden behind a hover interaction — the page loads with
-  "Price hidden" and a disabled button
-- After hovering, prices load asynchronously via JavaScript
-- Price digits are rendered as fullwidth Unicode characters (２５,８５２)
-  instead of standard ASCII digits (25,852) to confuse scrapers
-- The store also inserts a hidden `data-price` span with clean ASCII
-  digits as an accessibility element
-- Responses are intentionally slow and occasionally fail
-- A cookie consent popup appears on first visit and blocks interaction
+The INE mock store is deliberately difficult to scrape:
+- Prices are hidden behind a hover interaction — page loads with "Price hidden" and a disabled button
+- After hovering, the Reveal Price button enables and prices load asynchronously via JavaScript
+- Price digits are rendered as fullwidth Unicode characters (２５,８５２) instead of standard ASCII (25,852)
+- A hidden `data-price` span contains the clean ASCII price as an accessibility element
+- A cookie consent popup appears on first visit and blocks all interactions if not dismissed
+- Responses are intentionally slow and occasionally fail entirely
 
-To handle all of this I used Playwright (headless browser) with a
-multi-layer strategy:
+To handle all of this I used Playwright (headless browser) with this strategy:
 
-1. **Cookie popup dismissal** — before touching the price block,
-   detect and click Accept so it never blocks the reveal button
+1. **Cookie consent pre-acceptance** — set `cookie_consent=accepted` cookie before page load so the popup never appears, plus JS-based dismissal as backup
 
-2. **Hover simulation** — move the mouse in 30 small steps toward the
-   price block center, which triggers the CSS hover state and enables
-   the reveal button
+2. **Hover simulation** — on local/headed mode, move the mouse in 30 small steps toward the price block center which triggers the CSS hover state and enables the Reveal Price button. On server/headless mode, dispatch raw pointer and mouse events directly to the element
 
-3. **Up to 5 hover attempts per session** — if the button stays
-   disabled, move the mouse away and try again. Between attempts,
-   scroll the page slightly to reset hover state
+3. **JS button click** — use `page.evaluate()` to force-enable and click the button, bypassing Playwright's overlay detection entirely
 
-4. **Price extraction** — read the hidden `data-price` span using
-   `textContent` (not `innerText`, which ignores hidden elements).
-   This gives clean ASCII digits directly
+4. **Up to 5 reveal attempts per session** — if price block stays idle, retry the hover and click sequence
 
-5. **Fullwidth digit normalization** — convert Unicode fullwidth digits
-   (０-９, U+FF10–FF19) to ASCII before parsing, as fallback when
-   data-price is unavailable
+5. **Price extraction** — read the hidden `data-price` span using `textContent` (not `innerText` which ignores hidden elements) for clean ASCII digits. Fall back to finding the `font-weight:700` element and converting fullwidth Unicode digits to ASCII
 
-6. **3 outer retries** with exponential backoff on top of the 5 inner
-   hover attempts — so worst case the scraper makes 15 total attempts
-   before marking a run as failed
+6. **3 outer retries** with exponential backoff on top of 5 inner attempts
 
-7. **Honest logging** — every attempt is recorded in scrape_log
-   including failures, retry count, duration, and error message.
-   Nothing is hidden or silently swallowed
+7. **Honest logging** — every attempt is recorded in `scrape_log` including failures, retry count, duration, and error message. Nothing is silently swallowed
 
 ## Trade-offs made
 
 **Headed vs headless browser**
-Headless Playwright does not fire CSS :hover events reliably on this
-store. The store detects headless mode and keeps the button disabled.
-Running headed (visible browser) makes hover work correctly. On the
-production server (Render/Linux) the RENDER environment variable
-switches to headless automatically since there is no display — and the
-hover workaround (force-clicking after JS disables check) compensates.
+The store's React component checks for genuine CSS hover state to enable the reveal button. Headless Playwright does not fire CSS hover reliably. Running headed (visible browser) makes hover work correctly on local machines. On the production server (Render/Linux) there is no display, so headless mode is used automatically via `process.env.RENDER === 'true'` — the scraper falls back to JS event dispatching which works partially.
 
 **Speed vs reliability**
-Each scrape takes 20-45 seconds per product because of the slow mouse
-movement, wait times, and retry delays. A faster scraper would miss
-prices more often. Since scrapes run every 2 hours unattended, speed
-is less important than correctness.
+Each scrape takes 20-60 seconds per product because of mouse movement simulation, wait times, and retry delays. A faster scraper misses prices more often. Since scrapes run every 2 hours unattended, reliability matters more than speed.
 
 **External cron vs always-on loop**
-Free tier Render instances sleep after inactivity. An always-on
-setTimeout loop would be killed when the instance sleeps. Using
-cron-job.org as an external HTTP trigger means the cron fires
-regardless of whether the backend was sleeping, and the HTTP request
-itself wakes the instance up.
+Free tier Render instances sleep after inactivity. An always-on `setTimeout` loop gets killed when the instance sleeps. Using cron-job.org as an external HTTP trigger means the cron fires regardless, and the HTTP request itself wakes the instance.
 
-## What AI tools got wrong on the first attempt
+**Neon vs Supabase**
+Supabase is geo-restricted in some regions. Switched to Neon (pure PostgreSQL, permanent free tier, Singapore region) — same schema and SQL queries, just a different connection string.
 
-**Attempt 1 — Wrong assumption about store structure**
-The AI assumed the store used WooCommerce markup and wrote selectors
-for `.woocommerce-Price-amount bdi`. The store is a completely custom
-React app. Every selector returned null. Fixed by running a debug
-script that printed the actual HTML.
+## What AI tools got wrong on the first attempt and how I corrected it
 
-**Attempt 2 — Cheerio instead of Playwright**
-The AI tried Cheerio (static HTML parser) first. The store loads
-prices via JavaScript after a user interaction, so Cheerio always
-saw "Price hidden". Fixed by switching entirely to Playwright.
+**Wrong store assumption**
+The AI assumed WooCommerce markup and wrote selectors for `.woocommerce-Price-amount bdi`. The store is a custom React app — every selector returned null. Fixed by running a debug script that printed actual HTML.
 
-**Attempt 3 — Wrong price extraction**
-After getting Playwright working, prices like ₹25,852 were coming
-through as wrong values (e.g. 20,032). The AI was joining all child
-spans inside the price element — but the store renders the price as
-a single text node with fullwidth Unicode digits (２５,８５２), not
-split spans. The span-joining logic was reading partial/wrong content.
-Fixed by reading the hidden `data-price` span's textContent directly,
-and adding fullwidth-to-ASCII normalization as fallback.
+**Cheerio instead of Playwright**
+The AI tried Cheerio (static HTML parser) first. The store loads prices via JavaScript after a user interaction, so Cheerio always saw "Price hidden". Fixed by switching entirely to Playwright.
 
-**Attempt 4 — Off-screen window trick failed**
-To hide the Chrome window from the user, the AI tried
-`--window-position=-32000,-32000`. This silently broke hover because
-the OS does not deliver mouse events to off-screen windows. Fixed by
-keeping the window on-screen but using CDP to minimize it, then
-restore briefly for the hover interaction.
+**Wrong price extraction**
+After getting Playwright working, prices like ₹25,852 were returning wrong values. The AI was joining all child `<span>` tags inside the price element — but the store renders the price as a single text node with fullwidth Unicode digits (２５,８５２), not split spans. Fixed by reading the hidden `data-price` span's `textContent` directly and adding fullwidth-to-ASCII normalization as fallback.
+
+**Off-screen window trick failed**
+To hide the Chrome window locally, the AI tried `--window-position=-32000,-32000`. This silently broke hover because the OS does not deliver mouse events to off-screen windows. Fixed by keeping the window on-screen and using CDP to minimize it between interactions.
+
+**Cookie overlay blocking server clicks**
+On the server, the cookie consent overlay was intercepting all pointer events even after our dismissal attempt. Fixed by pre-setting cookie consent cookies in the browser context before page load, plus removing the overlay DOM element directly via `page.evaluate()`.
