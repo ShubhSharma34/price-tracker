@@ -40,19 +40,3 @@ Free tier Render instances sleep after inactivity. An always-on `setTimeout` loo
 **Neon vs Supabase**
 Supabase is geo-restricted in some regions. Switched to Neon (pure PostgreSQL, permanent free tier, Singapore region) — same schema and SQL queries, just a different connection string.
 
-## What AI tools got wrong on the first attempt and how I corrected it
-
-**Wrong store assumption**
-The AI assumed WooCommerce markup and wrote selectors for `.woocommerce-Price-amount bdi`. The store is a custom React app — every selector returned null. Fixed by running a debug script that printed actual HTML.
-
-**Cheerio instead of Playwright**
-The AI tried Cheerio (static HTML parser) first. The store loads prices via JavaScript after a user interaction, so Cheerio always saw "Price hidden". Fixed by switching entirely to Playwright.
-
-**Wrong price extraction**
-After getting Playwright working, prices like ₹25,852 were returning wrong values. The AI was joining all child `<span>` tags inside the price element — but the store renders the price as a single text node with fullwidth Unicode digits (２５,８５２), not split spans. Fixed by reading the hidden `data-price` span's `textContent` directly and adding fullwidth-to-ASCII normalization as fallback.
-
-**Off-screen window trick failed**
-To hide the Chrome window locally, the AI tried `--window-position=-32000,-32000`. This silently broke hover because the OS does not deliver mouse events to off-screen windows. Fixed by keeping the window on-screen and using CDP to minimize it between interactions.
-
-**Cookie overlay blocking server clicks**
-On the server, the cookie consent overlay was intercepting all pointer events even after our dismissal attempt. Fixed by pre-setting cookie consent cookies in the browser context before page load, plus removing the overlay DOM element directly via `page.evaluate()`.
