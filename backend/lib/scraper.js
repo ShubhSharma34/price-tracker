@@ -6,15 +6,147 @@ function sleep(ms) {
 
 function parsePrice(raw) {
   if (!raw) return null
-  const digits = String(raw).replace(/[^0-9]/g, '')
+  const normalized = String(raw).replace(/[０-９]/g, c =>
+    String.fromCharCode(c.charCodeAt(0) - 0xFF10 + 48)
+  )
+  const digits = normalized.replace(/[^0-9]/g, '')
   const num = parseFloat(digits)
   return isNaN(num) ? null : num
 }
 
+async function extractPrice(page) {
+  return await page.evaluate(() => {
+    const block = document.querySelector('.price-block')
+    if (!block) return { priceText: null, stockText: 'unknown' }
+
+    let priceText = null
+
+    // Primary: data-price hidden span (clean ASCII digits)
+    const dp = block.querySelector('[data-price="true"]')
+    if (dp) {
+      const t = dp.textContent.trim()
+      if (t && t.includes('₹')) priceText = t
+    }
+
+    // Fallback: bold element font-weight:700
+    if (!priceText) {
+      for (const el of block.querySelectorAll('*')) {
+        const style = el.getAttribute('style') || ''
+        if (style.includes('font-weight: 700') || style.includes('font-weight:700')) {
+          const t = el.textContent.trim()
+          if (t && t.includes('₹') && /[\d０-９]/.test(t)) { priceText = t; break }
+        }
+      }
+    }
+
+    // Fallback: pv-* class
+    if (!priceText) {
+      for (const el of block.querySelectorAll('*')) {
+        if (Array.from(el.classList).some(c => /^pv-/.test(c))) {
+          const t = el.textContent.trim()
+          if (t && t.includes('₹') && /[\d０-９]/.test(t)) { priceText = t; break }
+        }
+      }
+    }
+
+    // Fallback: any ₹ number
+    if (!priceText) {
+      const m = block.textContent.match(/₹[\d０-９,]+/)
+      if (m) priceText = m[0]
+    }
+
+    // Stock
+    let stockText = 'unknown'
+    const badge = block.querySelector('.stock-badge')
+    if (badge) {
+      const cls = badge.className
+      const txt = badge.innerText?.toLowerCase() || ''
+      if (cls.includes('out-of-stock') || txt.includes('out of stock')) stockText = 'out_of_stock'
+      else if (cls.includes('in-stock') || /\d+ in stock/.test(txt)) stockText = 'in_stock'
+    }
+    if (stockText === 'unknown') {
+      const full = document.body.innerText?.toLowerCase() || ''
+      if (full.includes('out of stock')) stockText = 'out_of_stock'
+      else if (full.includes('in stock')) stockText = 'in_stock'
+    }
+
+    return { priceText, stockText, blockClass: block.className }
+  })
+}
+
+async function triggerPriceReveal(page) {
+  // Method 1: Find React fiber on the price block and call its event handlers
+  const reactTriggered = await page.evaluate(() => {
+    const block = document.querySelector('.price-block')
+    if (!block) return false
+
+    // Find React internal fiber key
+    const fiberKey = Object.keys(block).find(k =>
+      k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
+    )
+
+    if (fiberKey) {
+      let fiber = block[fiberKey]
+      // Walk up fiber tree to find onMouseEnter/onPointerEnter handlers
+      while (fiber) {
+        const props = fiber.memoizedProps || fiber.pendingProps
+        if (props) {
+          const handler = props.onMouseEnter || props.onPointerEnter || props.onMouseOver
+          if (handler) {
+            try {
+              handler({ type: 'mouseenter', bubbles: true })
+              return true
+            } catch(e) {}
+          }
+        }
+        fiber = fiber.return
+      }
+    }
+    return false
+  })
+
+  if (reactTriggered) {
+    console.log(`      React handler triggered`)
+    await sleep(2000)
+    return
+  }
+
+  // Method 2: Dispatch events on every parent element up to body
+  await page.evaluate(() => {
+    const block = document.querySelector('.price-block')
+    if (!block) return
+
+    const rect = block.getBoundingClientRect()
+    const x = rect.left + rect.width / 2
+    const y = rect.top + rect.height / 2
+
+    const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }
+
+    // Fire on block and all parents
+    let el = block
+    while (el && el !== document.body) {
+      el.dispatchEvent(new MouseEvent('mouseover', opts))
+      el.dispatchEvent(new MouseEvent('mouseenter', { ...opts, bubbles: false }))
+      el.dispatchEvent(new PointerEvent('pointerover', opts))
+      el.dispatchEvent(new PointerEvent('pointerenter', { ...opts, bubbles: false }))
+      el = el.parentElement
+    }
+  })
+
+  await sleep(2000)
+}
+
 async function scrapeWithPlaywright(url, attemptNumber) {
+  const isServer = process.env.RENDER === 'true'
+
   const browser = await chromium.launch({
-    headless: process.env.RENDER === 'true',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,800'],
+    headless: isServer,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--window-size=1280,800',
+      ...(isServer ? ['--disable-dev-shm-usage', '--disable-gpu'] : []),
+    ],
   })
 
   const context = await browser.newContext({
@@ -25,7 +157,7 @@ async function scrapeWithPlaywright(url, attemptNumber) {
   const page = await context.newPage()
 
   try {
-    console.log(`  → Attempt ${attemptNumber}: ${url}`)
+    console.log(`  → Attempt ${attemptNumber} [${isServer ? 'headless' : 'headed'}]: ${url}`)
 
     await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 })
     await sleep(2000)
@@ -42,30 +174,32 @@ async function scrapeWithPlaywright(url, attemptNumber) {
 
     await page.waitForSelector('.price-block', { timeout: 10000 })
 
-    // Try up to 5 hover+click attempts within one browser session
     let priceText = null
     let stockText = 'unknown'
 
-    for (let hover = 1; hover <= 5; hover++) {
-      console.log(`    Hover attempt ${hover}/5`)
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      console.log(`    Reveal attempt ${attempt}/5`)
 
-      const box = await page.locator('.price-block').boundingBox()
-      if (!box) break
-
-      const centerX = box.x + box.width / 2
-      const centerY = box.y + box.height / 2
-
-      // Move mouse away first, then slowly back
-      await page.mouse.move(0, 0)
-      await sleep(300)
-
-      // Slow move in 30 steps
-      for (let i = 1; i <= 30; i++) {
-        await page.mouse.move((centerX / 30) * i, (centerY / 30) * i)
-        await sleep(40)
+      if (!isServer) {
+        // LOCAL: slow mouse move
+        const box = await page.locator('.price-block').boundingBox()
+        if (box) {
+          const cx = box.x + box.width / 2
+          const cy = box.y + box.height / 2
+          await page.mouse.move(0, 0)
+          await sleep(200)
+          for (let i = 1; i <= 30; i++) {
+            await page.mouse.move((cx / 30) * i, (cy / 30) * i)
+            await sleep(35)
+          }
+          await sleep(1500)
+        }
+      } else {
+        // SERVER: React fiber trigger + event dispatch
+        await triggerPriceReveal(page)
       }
-      await sleep(1500)
 
+      // Check button state
       const btnEnabled = await page.evaluate(() => {
         const btn = document.querySelector('.price-block button')
         return btn ? !btn.disabled : false
@@ -75,122 +209,57 @@ async function scrapeWithPlaywright(url, attemptNumber) {
       if (btnEnabled) {
         await page.click('.price-block button')
       } else {
-        // Try clicking via JS as backup
+        // Force enable + click
         await page.evaluate(() => {
           const btn = document.querySelector('.price-block button')
-          if (btn) btn.click()
+          if (btn) {
+            btn.disabled = false
+            btn.removeAttribute('disabled')
+            btn.click()
+          }
         })
+        console.log(`      Force clicked button`)
       }
 
-      // Wait for price to appear
+      // Wait for price block to leave idle state
       try {
         await page.waitForFunction(() => {
-          const block = document.querySelector('.price-block')
-          return block && !block.classList.contains('price-idle')
-        }, { timeout: 8000 })
-        console.log(`      Price loaded ✓`)
+          const b = document.querySelector('.price-block')
+          return b && !b.classList.contains('price-idle')
+        }, { timeout: 10000 })
+        console.log(`      Price revealed ✓`)
       } catch {
-        console.log(`      Still idle — retrying hover`)
-        // Scroll page slightly and try again (sometimes resets hover state)
-        await page.evaluate(() => window.scrollBy(0, 10))
-        await sleep(500)
-        await page.evaluate(() => window.scrollBy(0, -10))
-        await sleep(500)
-        continue
+        console.log(`      Still idle — will extract anyway`)
       }
 
       await sleep(2000)
 
-      // Extract price
-      const result = await page.evaluate(() => {
-        const block = document.querySelector('.price-block')
-        if (!block) return { priceText: null, stockText: 'unknown' }
-
-        let priceText = null
-
-        // Bold price element (font-weight: 700)
-        for (const el of block.querySelectorAll('*')) {
-          const style = el.getAttribute('style') || ''
-          if (style.includes('font-weight: 700') || style.includes('font-weight:700')) {
-            let joined = ''
-            el.querySelectorAll('span').forEach(s => { joined += s.innerText })
-            joined = joined.trim()
-            if (joined.includes('₹') && /\d/.test(joined)) {
-              priceText = joined
-              break
-            }
-          }
-        }
-
-        // pv-* class fallback
-        if (!priceText) {
-          for (const el of block.querySelectorAll('*')) {
-            const hasPv = Array.from(el.classList).some(c => /^pv-/.test(c))
-            if (hasPv) {
-              let joined = ''
-              el.querySelectorAll('span').forEach(s => { joined += s.innerText })
-              joined = joined.trim()
-              if (joined.includes('₹') && /\d/.test(joined)) {
-                priceText = joined
-                break
-              }
-            }
-          }
-        }
-
-        // data-price fallback
-        if (!priceText) {
-          const dp = block.querySelector('[data-price="true"]')
-          if (dp && dp.innerText.includes('₹')) priceText = dp.innerText.trim()
-        }
-
-        // Regex fallback
-        if (!priceText) {
-          const m = block.innerText.match(/₹[\d,]+/)
-          if (m) priceText = m[0]
-        }
-
-        // Stock
-        let stockText = 'unknown'
-        const badge = block.querySelector('.stock-badge')
-        if (badge) {
-          const cls = badge.className
-          const txt = badge.innerText.toLowerCase()
-          if (cls.includes('out-of-stock') || txt.includes('out of stock')) stockText = 'out_of_stock'
-          else if (cls.includes('in-stock') || /\d+ in stock/.test(txt) || txt.includes('in stock')) stockText = 'in_stock'
-        }
-        if (stockText === 'unknown') {
-          const full = document.body.innerText.toLowerCase()
-          if (full.includes('out of stock')) stockText = 'out_of_stock'
-          else if (full.includes('in stock')) stockText = 'in_stock'
-        }
-
-        return { priceText, stockText }
-      })
+      const result = await extractPrice(page)
+      console.log(`      Extracted: "${result.priceText}", stock: "${result.stockText}", block: "${result.blockClass}"`)
 
       if (result.priceText) {
         priceText = result.priceText
         stockText = result.stockText
-        console.log(`      Got price: ${priceText}, stock: ${stockText}`)
-        break // success — stop hover attempts
+        break
       }
 
-      // Price still not found — click Refresh price button if visible and retry
+      // Click refresh if visible
       try {
-        const refreshBtn = page.locator('button:has-text("Refresh price"), button:has-text("REFRESH PRICE")')
+        const refreshBtn = page.locator('button:has-text("Refresh")')
         if (await refreshBtn.count() > 0) {
           await refreshBtn.first().click()
-          console.log(`      Clicked refresh price button`)
+          console.log(`      Clicked refresh button`)
           await sleep(3000)
         }
       } catch { }
+
+      // Small wait before next attempt
+      await sleep(1000)
     }
 
-    console.log(`    Final — Price: "${priceText}", Stock: "${stockText}"`)
+    console.log(`    Final: "${priceText}" → ${parsePrice(priceText)}, stock: ${stockText}`)
 
-    if (!priceText) {
-      throw new Error('Price not found after 5 hover attempts')
-    }
+    if (!priceText) throw new Error('Price not found after all attempts')
 
     return { price: parsePrice(priceText), stock: stockText }
 
