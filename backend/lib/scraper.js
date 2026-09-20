@@ -206,21 +206,16 @@ async function scrapeWithPlaywright(url, attemptNumber) {
       })
       console.log(`      Button enabled: ${btnEnabled}`)
 
-      if (btnEnabled) {
-        await page.click('.price-block button')
-      } else {
-        // Force enable + click
-        await page.evaluate(() => {
-          const btn = document.querySelector('.price-block button')
-          if (btn) {
-            btn.disabled = false
-            btn.removeAttribute('disabled')
-            btn.click()
-          }
-        })
-        console.log(`      Force clicked button`)
-      }
-
+     // Always use evaluate click — avoids Playwright's "enabled" check entirely
+await page.evaluate(() => {
+  const btn = document.querySelector('.price-block button')
+  if (btn) {
+    btn.disabled = false
+    btn.removeAttribute('disabled')
+    btn.click()
+  }
+})
+console.log(`      Clicked button via JS (enabled: ${btnEnabled})`)
       // Wait for price block to leave idle state
       try {
         await page.waitForFunction(() => {
